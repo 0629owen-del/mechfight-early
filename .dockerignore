@@ -1,0 +1,13 @@
+# dev-only content stays out of the image
+.git
+.gitignore
+.omc
+.dockerignore
+tools/
+tests/
+docs/
+*.md
+__pycache__/
+**/__pycache__/
+*.pyc
+.DS_Store
