@@ -73,15 +73,22 @@ class Bot:
         self.degrade_level = 0
         self._win: deque = deque()
         self._hard_seen = 0
+        self._l2_hard = 0                # hard-late ticks at L2 in the current window (R15.3 L3 gate)
+        self._prev_late = False          # the previous act() was itself over the hard deadline
         self._ticks = 0
         self.boot_ms: Dict[str, float] = {}
         self.last_stage_ms: Dict[str, float] = {}   # per-stage ms of the last act() (tools/bench.py)
         t_boot = time.perf_counter()
-        try:
-            self._boot(C)
-        except Exception:
-            runner.log(f"boot failed (SAFE controller only):\n{traceback.format_exc()}")
-            self.ready = False
+        # Baseline build: BOT_SAFE_ONLY=1 (one ENV line in the Dockerfile) plays the whole match on the
+        # SAFE controller, so a submission or a minisim batch shows what the full pipeline adds.
+        if os.environ.get("BOT_SAFE_ONLY") == "1":
+            runner.log("BOT_SAFE_ONLY=1: SAFE controller only (baseline build)")
+        else:
+            try:
+                self._boot(C)
+            except Exception:
+                runner.log(f"boot failed (SAFE controller only):\n{traceback.format_exc()}")
+                self.ready = False
         self.boot_ms["total"] = (time.perf_counter() - t_boot) * 1000.0
         if self.tlm is not None:
             self.tlm.event("boot", _force=True, ready=self.ready, map_dir=self.map_dir,
@@ -180,27 +187,43 @@ class Bot:
     def _degrade_update(self, el_ms: float) -> None:
         C = self.C
         n = int(C.DEGRADE_WINDOW_N)
-        hard = el_ms > C.HARD_DEADLINE_MS
+        late = el_ms > C.HARD_DEADLINE_MS
         ri = self.runner_info
-        if ri is not None and ri.hard_overruns > self._hard_seen:   # late answers the runner replaced
-            hard = True
+        replaced = ri is not None and ri.hard_overruns > self._hard_seen   # late answers the runner replaced
+        if replaced:
             self._hard_seen = ri.hard_overruns
+        # The runner counts a late act() after that act() has already been counted here by its own time,
+        # so its count arrives one call later: one late tick must not count as two (the L3 gate below).
+        hard = late or (replaced and not self._prev_late)
+        self._prev_late = late
         self._win.append(el_ms)
         old = self.degrade_level
+        # L1 and L2 only cut search budgets; L3 hands the legs to SAFE (straight to the zone center), so it
+        # takes DEGRADE_L3_HARD_N hard-late ticks at L2 inside one window, and is left after
+        # DEGRADE_L3_EXIT_N clean ticks instead of a full window.
+        need = int(C.DEGRADE_L3_EXIT_N) if old >= 3 else n
         if hard:
-            self.degrade_level = min(3, self.degrade_level + 1)
+            if old < 2:
+                self.degrade_level = old + 1
+                self._l2_hard = 0
+            elif old == 2:
+                self._l2_hard += 1
+                if self._l2_hard >= int(C.DEGRADE_L3_HARD_N):
+                    self.degrade_level = 3
+                    self._l2_hard = 0
             self._win.clear()
-        elif len(self._win) >= n:
+        elif len(self._win) >= need:
             s = sorted(self._win)
             p95 = s[min(len(s) - 1, int(0.95 * len(s)))]
             if p95 > C.SOFT_DEADLINE_MS:
-                self.degrade_level = min(3, self.degrade_level + 1)
+                self.degrade_level = min(2, old + 1)    # a soft overrun never holds L3: only hard ticks do
                 self._win.clear()
-            elif self.degrade_level > 0:
-                self.degrade_level -= 1
+            elif old > 0:
+                self.degrade_level = old - 1
                 self._win.clear()
             else:
                 self._win.popleft()
+            self._l2_hard = 0               # the L3 count does not outlive a window
         if self.degrade_level != old:
             self._apply_degrade()
             if self.tlm is not None:

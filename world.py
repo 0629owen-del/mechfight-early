@@ -18,9 +18,16 @@ telemetry and the decision layer (not in the contract, all plain attributes):
     world.update_ms, world.los_calls, world.exceptions, world.last_error
 Queries beyond the contract: weapon_probs(id), possible_kinds(id), zone_phase(t), take_exceptions().
 
-LOS (A-13): trees are ignored, so every ray here is mapdata.los (buildings, stadium, bridges,
-terrain). Rays are cached per track keyed by (our 1 m cell, its 1 m cell, z); when the LOS_MS_CAP
-slice runs out the previous result is reused (geometry is static, so a cache hit is exact).
+Two kinds of ray (A-13 / A-14, protocol 7 and 8):
+- SHOT line, _los() = mapdata.los (buildings, stadium, bridges, terrain; trees ignored). A mech
+  listed in obs.mechs has its real, current position and trees do not stop shots, so Track.visible,
+  tx.los_geo / los_since / vis_since (fire permission, aiming, "can it hit us") stay on this line.
+  Rays are cached per track keyed by (our 1 m cell, its 1 m cell, z); when the LOS_MS_CAP slice
+  runs out the previous result is reused (geometry is static, so a cache hit is exact).
+- SIGHT line, _sight() = mapdata.visible (the shot line + tree trunks, + dense canopy beyond
+  vision.near_range): "would the server list something at this spot for us right now". Used where
+  NOT being listed is taken as evidence: a remembered item / NPC whose spot we look at is gone, a
+  ghost whose spot we look at is empty, a 5 m cell has been looked at (seen cells).
 """
 from __future__ import annotations
 
@@ -121,6 +128,7 @@ class WorldModel:
         self.vis_range = _f(p("vision.range", 200), 200.0)
         self.vis_near = _f(p("vision.near_range", 45), 45.0)
         self.vis_half_fov = math.radians(_f(p("vision.fov_deg", 120), 120.0)) / 2.0
+        self.vis_canopy = bool(p("vision.canopy_blocks", True))
         self.snd_near = _f(p("sound.near", 60), 60.0)
         self.snd_mid = _f(p("sound.mid", 160), 160.0)
         self.snd_noise_deg = _f(p("sound.bearing_noise_deg", 7), 7.0)
@@ -520,7 +528,8 @@ class WorldModel:
                     tr.still_since = t
             else:
                 tr.still_since = None
-            # visibility: our vision geometry (protocol 8) + building/terrain LOS (A-13)
+            # "visible" = listed + inside our vision geometry + SHOT line (A-13 / A-14): a listed mech
+            # behind canopy keeps its real position and can be shot, so trees are not tested here
             b = math.atan2(pos[1] - my, pos[0] - mx)
             x.in_view = d <= near or (d <= far and abs(wrap(b - yaw)) <= self.vis_half_fov)
             x.los_geo = self._track_los(tr, x, sl)
@@ -566,9 +575,24 @@ class WorldModel:
         return ok
 
     def _los(self, a, b) -> bool:
+        """SHOT line a -> b: buildings and terrain only (trees never stop shots, protocol 7)."""
         self.los_calls += 1
         try:
             return bool(self.map.los(a, b))
+        except Exception:
+            return True
+
+    def _sight(self, eye, b, near: bool) -> bool:
+        """SIGHT line eye -> b (protocol 8): the shot line plus tree trunks, plus dense canopy unless
+        `near` (b inside vision.near_range: proximity sensing is not blocked by canopy) or the match
+        runs with vision.canopy_blocks false. True = the server would show us an object at b.
+        CONTRACTS 6.1 only binds mapdata.los: a map without visible() answers with the shot line."""
+        vis = getattr(self.map, "visible", None)
+        if vis is None:
+            return self._los(eye, b)
+        self.los_calls += 1
+        try:
+            return bool(vis(eye, b, near=near or not self.vis_canopy))
         except Exception:
             return True
 
@@ -1043,7 +1067,7 @@ class WorldModel:
             if isinstance(cu, dict) and cu.get("id") is not None:
                 cid = int(_f(cu.get("id"), -1))
                 self.cubes[cid] = CubeObs(id=cid, pos=_v3(cu.get("pos")))
-        # forget remembered items whose spot is in view (with LOS) but not listed
+        # forget remembered items whose spot is in near view (SIGHT line: a trunk can hide it) but not listed
         for store, listed, h in ((self.pickups, listed_p, 0.5), (self.crates, listed_c, 1.0)):
             gone = []
             for iid, m in store.items():
@@ -1073,13 +1097,15 @@ class WorldModel:
             m.capture_s = _f(dr.get("capture_s"), m.capture_s)
             m.progress = _f(dr.get("progress"))
             m.holder = int(_f(holder, -1)) if holder is not None else None
-            m.lands_at = t + lands_in
+            if lands_in > 0.0:              # once landed the time stays: M7's DROP_TIMEOUT_S counts from it
+                m.lands_at = t + lands_in
         for did in [d for d in self.drops if d not in listed_d]:
             del self.drops[did]
 
     def _point_in_view(self, pos: Vec3, h: float, sl, near_only: bool = False) -> bool:
-        """Would we see an object at pos now (vision geometry + LOS)? near_only: proximity range only
-        (the recorded stream shows item listings flicker in the FOV wedge beyond near range)."""
+        """Would the server show us an object at pos now (protocol 8: vision geometry + SIGHT line)?
+        Inside near range trunks hide it, beyond it trunks and dense canopy do. near_only: proximity
+        range only (4.4: item / NPC memory is only dropped on a near look)."""
         me = self.me
         dx, dy = pos[0] - me.pos[0], pos[1] - me.pos[1]
         d = math.hypot(dx, dy)
@@ -1089,7 +1115,7 @@ class WorldModel:
             return False
         if sl is not None and sl.expired():
             return False
-        return self._los((me.pos[0], me.pos[1], me.eye_z), (pos[0], pos[1], pos[2] + h))
+        return self._sight((me.pos[0], me.pos[1], me.eye_z), (pos[0], pos[1], pos[2] + h), d <= near)
 
     def _offer_update(self, of) -> None:
         if not isinstance(of, dict) or of.get("id") is None:
@@ -1270,7 +1296,8 @@ class WorldModel:
                 z = self.map.surface_h(x, y) + 1.0
             except Exception:
                 z = me.pos[2] + 1.0
-            if self._los(eye, (x, y, z)):
+            # SIGHT line: a far cell under a dense crown or behind a trunk has not been looked at
+            if self._sight(eye, (x, y, z), math.hypot(x - eye[0], y - eye[1]) <= near):
                 seen[k] = 1
                 self.seen_count += 1
             checks += 1

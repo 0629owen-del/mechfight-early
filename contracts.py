@@ -186,7 +186,7 @@ class DropState:
     progress: float
     holder: Optional[int]
     first_seen_t: float
-    lands_at: float                   # t + lands_in when first seen (refreshed each tick)
+    lands_at: float                   # landing time: t + lands_in, refreshed while it falls, fixed once down
 
 
 @dataclass(slots=True)
@@ -377,6 +377,8 @@ class TrackAssess:
     in_its_reach: bool                # we are inside its weapon reach with LOS
     charging_at_us: bool              # O3 test
     closing_speed: float              # >0 = closing
+    A_entry: float = 0.0              # 8.2.1 engage ratio: j assumed aiming at us, no reload/rear discounts
+    dps_to_us_entry: float = 0.0      # DPS(j -> us) under the A_entry assumptions
 
 
 @dataclass(slots=True)
@@ -398,7 +400,8 @@ class FightEval:
     lose_clauses: frozenset = frozenset()   # subset of "abcdefghi"
     lose_tracks: Dict[str, int] = field(default_factory=dict)  # clause -> track id (e, g, i)
     cornered: bool = False
-    t_close: float = float("inf")     # 8.2.6
+    t_close: float = float("inf")     # 8.2.6 escape budget (lightning: time to close; ranged: CORNER_TTK_FRAC x ttk)
+    cover_eta: Optional[float] = None # 8.2.6 escape ETA (cover point, else out of reach)
 
 
 @dataclass(slots=True)
@@ -411,6 +414,8 @@ class Assessment:
     hostiles: List[int] = field(default_factory=list)   # H: can damage us now (8.2.1)
     A: float = 0.0                    # vs target with all of H
     A_rush: Optional[float] = None    # PB_L closing (8.2.1)
+    A_entry: float = 0.0              # vs target with all of H, engage assumptions (8.2.1)
+    ttk_them_on_us_entry: float = float("inf")   # Σ H under the A_entry assumptions
     ttk_us_on_target: float = float("inf")
     ttk_them_on_us: float = float("inf")
     threats: Threats = field(default_factory=Threats)
@@ -435,6 +440,8 @@ class LegRequest:
     goal: Optional[Vec2] = None       # optional target point (follower / telemetry)
     juke_ok: bool = True              # False: straight dash / charging / RUSH inside LIGHTNING_RUSH_R
     is_cover_dash: bool = False
+    nav: bool = False                 # direction from the navigation layer (path follower, climb, zone field,
+                                      # stuck ladder): kept even when it fails the leg clearance probe
 
 
 @dataclass(slots=True)

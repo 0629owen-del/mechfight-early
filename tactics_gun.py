@@ -56,7 +56,7 @@ def run(sub: str, ctx) -> str:
         m.legs(ctx, "RG1", (-bvec[0], -bvec[1]), 1.0, None)
     elif d > C.GUN_HOLD_MAX:
         st = m.go(ctx, "x2", (tr.pos[0], tr.pos[1]), exposure=True)
-        m.legs(ctx, "RG1", st.direction, 1.0, (tr.pos[0], tr.pos[1]))
+        m.legs(ctx, "RG1", st.direction, 1.0, (tr.pos[0], tr.pos[1]), nav=st.rule != "8.9f")
     else:
         m.legs(ctx, "RG1", M.perp(bvec, side), 1.0, None)
     m.fire(ctx, tr.id, {"mortar"} if use_mortar else {"gun", "laser", "lightning"})

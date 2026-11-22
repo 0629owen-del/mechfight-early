@@ -8,7 +8,7 @@ no state: the periodic jump is derived from obs["t"]. Thread-safe (reads only).
     aim:   nearest mech in obs.mechs, else the move heading (pitch 0)
     fire:  gun if the actual aim error < the F1 tolerance and in range; lightning if a mech is in
            range (3D) and inside the cone margin with energy; laser / mortar never
-    boost: if outside the zone
+    boost: if outside the zone and on the ground (a sprint; never a jet)
     jump:  every SAFE_JUMP_PERIOD_S while horizontal speed < STUCK_SPEED (and we want to move)
     pick:  offers are still answered (GP list for the held loadout, then UPGRADE_FALLBACK)
 """
@@ -114,7 +114,9 @@ def act(obs: Dict[str, Any], C: Any) -> Dict[str, Any]:
         action["aim"] = [heading, 0.0]
     action["fire"] = fire
 
-    action["boost"] = not bool(me.get("in_zone", True)) and float(me.get("energy", 0) or 0) > 0
+    # sprint only: in the air boost is a jet (protocol 6) and would lift us instead of moving us
+    action["boost"] = (not bool(me.get("in_zone", True)) and bool(me.get("grounded", True))
+                       and float(me.get("energy", 0) or 0) > 0)
     vel = me.get("vel") or [0, 0, 0]
     speed = math.hypot(float(vel[0]), float(vel[1]))
     t = float(obs.get("t", 0.0))

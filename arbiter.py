@@ -27,6 +27,7 @@ from contracts import AIM_PRIO, BOOST_ORDER, JUMP_ORDER, LEG_FILTER_ORDER, LEG_O
 INF = float("inf")
 LOW_SCOPE_OWNERS = ("X4", "L5", "L6", "L7", "L8")
 COAST_VETO_EXEMPT = ("O1", "O6", "CLIMB")
+AIR_BOOST_OWNERS = ("CLIMB", "O6")     # jets on purpose (climbs, the fall brake); every other owner sprints
 _IMPLICIT_RULE = {"gun": "F1", "laser": "F2", "lightning": "F3", "mortar": "F4"}
 
 
@@ -172,7 +173,14 @@ class Arbiter:
             cands.append((c, k, mspeed))
         stop = ((0.0, 0.0), n, 0.0)
         pos = me.pos
-        moving = [c for c in cands if self._clear(nav, pos, c[0])]
+        # a navigation direction (follower, climb, zone field, ladder jump/jet) goes over or into the obstacle on
+        # purpose; the probe only knows ground heights, so it must not drop it
+        # (a silent move is slower than O5's STUCK_MOVE_MIN, so it could never trigger the ladder: it keeps the probe)
+        nav_dir = bool(unstick.nav if unstick is not None else owner is not None and owner.nav)
+        nav_dir = nav_dir and mspeed >= getattr(nav, "_STUCK_MOVE_MIN", 0.0)
+        if nav is not None:
+            nav.leg_nav = nav_dir        # O5 pacing only counts a navigation direction (read next tick with the move)
+        moving = [c for c in cands if (c[1] == -1 and nav_dir) or self._clear(nav, pos, c[0])]
         cands = (moving if moving else cands) + [stop]
         # hard filters in LEG_FILTER_ORDER
         order = {lv: i for i, lv in enumerate(LEG_FILTER_ORDER)}
@@ -252,7 +260,8 @@ class Arbiter:
         rule = (owner.rule if owner is not None else "none")
         # O7 juke (8.10): rotate, re-check filters, fail -> no juke
         if (intent.juke is not None and owner is not None and owner.juke_ok and not owner.is_cover_dash
-                and unstick is None and win[1] != n and level not in ("L3", "L3b", "L4")):
+                and unstick is None and win[1] != n and level not in ("L3", "L3b", "L4")
+                and not (nav_dir and getattr(nav, "_climb", None) is not None)):   # a climb's jet is aimed at the ledge
             a = intent.juke.side * intent.juke.angle
             ca, sa = math.cos(a), math.sin(a)
             r = (d[0] * ca - d[1] * sa, d[0] * sa + d[1] * ca)
@@ -451,6 +460,13 @@ class Arbiter:
         for o in BOOST_ORDER:
             b = first.get(o)
             if b is None:
+                continue
+            if not me.grounded and o not in AIR_BOOST_OWNERS:
+                # Protocol 6: in the air boost is a jet. A sprint request (want True) that arrives while we are
+                # off the ground (after a jump, a climb start, a ledge) lifted the bot straight up until the
+                # energy was gone (45 m in minisim seed 501); a sprint veto (want False) would cut out a CLIMB
+                # jet below it. Sprint owners say nothing about a jet: every request of theirs is void in the
+                # air and the next owner decides.
                 continue
             on = bool(b.want and me.energy > b.floor)
             if on and me.energy < C.COAST_BOOST_MIN_ENERGY and o not in COAST_VETO_EXEMPT:

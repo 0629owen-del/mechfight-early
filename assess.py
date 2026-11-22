@@ -12,7 +12,7 @@ Extra read-only attributes on Assessor (telemetry / decision layer, not in the c
     hostile_dps     {track id: DPS on us incl. aim factor} for the members of H
     call_S, call_C, call_R, call_raw, call_n   last R0.1 inputs (median sight, wall share, radius)
     update_ms, los_calls, exceptions, last_error
-Module helpers beyond the contract: raw_dps, hit_chance, enemy_wstats, hp_eff_enemy, hp_eff_self,
+Module helpers beyond the contract: raw_dps, hit_chance, enemy_wstats, hp_eff_enemy, hp_eff_self, hp_self,
 a_rush, tau_edge, zone_eta_fallback, terrain_stats, terrain_call_from_stats, lightning_cone_half.
 
 A-19: our lightning fire gate uses +-LIGHTNING_CONE_MARGIN x cone/2; the nearest-object check and enemy
@@ -173,7 +173,14 @@ def hp_eff_enemy(tr, C) -> float:
 
 
 def hp_eff_self(me) -> float:
+    """Armor-adjusted HP, for comparing our HP with another mech's raw HP (RL4). Never divide it by a
+    DPS from _their_dps: that DPS already carries (1 - armor)."""
     return max(1.0, me.hp) / max(0.05, 1.0 - me.armor)
+
+
+def hp_self(me) -> float:
+    """Our raw HP: the numerator of every time-to-kill-us, because _their_dps applies our armor."""
+    return max(1.0, me.hp)
 
 
 def lightning_cone_half(C, worst: bool) -> float:
@@ -409,6 +416,7 @@ class Assessor:
         self.laser_next_t: Dict[int, float] = {}
         self.hostile_dps: Dict[int, float] = {}
         self._dps_from: Dict[int, float] = {}
+        self._dps_from_entry: Dict[int, float] = {}
         self._hp_eff: Dict[int, float] = {}
         self.update_ms = 0.0
         self.los_calls = 0
@@ -460,7 +468,7 @@ class Assessor:
         return tuple(out[:2])
 
     def _our_dps(self, world, tr, d: float, d3: float, los: bool, rear_on_j: bool, cover_j: bool,
-                 energy: Optional[float] = None, t: Optional[float] = None) -> float:
+                 energy: Optional[float] = None, t: Optional[float] = None, no_reload: bool = False) -> float:
         me = world.me
         C = self.C
         t = world.tick.t if t is None else t
@@ -472,12 +480,12 @@ class Assessor:
             if i < len(me.equip_until) and t < me.equip_until[i]:
                 continue
             s += dps(w.kind, w.stats, d, me.cubes, tr.cubes, rear=rear_on_j, armor=0.0, energy=e, C=C,
-                     enemy=False, d3=d3, los=los, reloading=(w.kind == "gun" and w.reload > 0.0),
+                     enemy=False, d3=d3, los=los, reloading=(not no_reload and w.kind == "gun" and w.reload > 0.0),
                      shorted=(w.kind == "laser" and t < me.short_until), cover=cover_j, ammo=w.ammo)
         return s
 
     def _their_dps(self, world, tr, kinds, d: float, d3: float, los: bool, rear_on_us: bool,
-                   cover_us: bool) -> float:
+                   cover_us: bool, no_reload: bool = False) -> float:
         me = world.me
         C = self.C
         t = world.tick.t
@@ -485,7 +493,7 @@ class Assessor:
         for k in kinds:
             s += dps(k, enemy_wstats(C, k), d, tr.cubes, me.cubes, rear=rear_on_us, armor=me.armor,
                      energy=tr.energy_est, C=C, enemy=True, d3=d3, los=los,
-                     reloading=(k == "gun" and tr.reloading_until > t), cover=cover_us,
+                     reloading=(not no_reload and k == "gun" and tr.reloading_until > t), cover=cover_us,
                      range_mult=tr.lightning_range_mult)
         return s
 
@@ -536,7 +544,7 @@ class Assessor:
         mx, my, mz = me.pos
         h_me = _f(me.stats.get("height"), self.mech_h * me.s)
         cz_me = mz + 0.5 * h_me
-        hp_us = hp_eff_self(me)
+        hp_us = hp_self(me)                      # armor is applied once, inside _their_dps
         wd_me = self._wall_dist(mx, my)
         cover_us = wd_me is not None and wd_me <= C.COVER_DASH_R
         laser_tol_rad = C.LASER_AIM_TOL_RAD
@@ -549,6 +557,7 @@ class Assessor:
         fire_half = lightning_cone_half(C, worst=False)
         hostile_dps: Dict[int, float] = {}
         self._dps_from = {}
+        self._dps_from_entry = {}
         self._hp_eff = {}
         chargers = []
         aim1 = []
@@ -583,6 +592,17 @@ class Assessor:
             ttk_us = hpj / ours if ours > 0 else INF
             ttk_them = hp_us / them if them > 0 else INF
             a_j = _ratio(ttk_them, ttk_us)
+            # 8.2.1 engage ratio (early-death fix E1): a mech not busy with another mech turns on us
+            # within about a second, so for ENTRY decisions it is assumed to aim at us, its reload and
+            # our rear-hit bonus are not counted; only a mech fighting someone else keeps the discounts.
+            busy = (tr.kind == "mech" and tr.fighting_with is not None and tr.fighting_with != me.id)
+            if busy or C.ENGAGE_MODEL == "live":
+                them_e, ours_e = them, ours
+            else:
+                them_e = self._their_dps(world, tr, kinds, d, d3, los, rear_on_us, cover_us, no_reload=True)
+                ours_e = self._our_dps(world, tr, d, d3, los, False, wd_j is not None and wd_j <= C.COVER_DASH_R,
+                                       no_reload=True)
+            a_j_entry = _ratio(hp_us / them_e if them_e > 0 else INF, hpj / ours_e if ours_e > 0 else INF)
             dvx = tr.vel[0] - me.vel[0]
             dvy = tr.vel[1] - me.vel[1]
             closing = -(dx * dvx + dy * dvy) / d if d > 1e-6 else 0.0
@@ -613,8 +633,10 @@ class Assessor:
             A.per_track[tid] = TrackAssess(id=tid, d=d, d3=d3, bearing=b, los=los, dps_to_us=them,
                                            dps_from_us=ours, ttk_us_on_j=ttk_us, ttk_them_on_us=ttk_them,
                                            A=a_j, prio=prio, aiming_at_us=aiming, in_its_reach=in_reach,
-                                           charging_at_us=charging_at_us, closing_speed=closing)
+                                           charging_at_us=charging_at_us, closing_speed=closing,
+                                           A_entry=a_j_entry, dps_to_us_entry=them_e)
             self._dps_from[tid] = ours
+            self._dps_from_entry[tid] = ours_e
             self._hp_eff[tid] = hpj
             if charging_at_us:
                 left = _f(self.laser_cfg.get("charge"), 0.75) - (t - (tr.charging_since if tr.charging_since is not None else t))
@@ -633,12 +655,13 @@ class Assessor:
         self.hostile_dps = hostile_dps
         A.hostiles = sorted(hostile_dps)
         # main threat: highest DPS on us among H mechs, nearest on ties
+        seen_first = bool(C.VISIBLE_THREAT_FIRST)   # E4 toggle; False: DPS then distance only, as before E4
         mt, mv = None, None
         for tid in A.hostiles:
             tr = world.tracks[tid]
             if tr.kind != "mech":
                 continue
-            v = (hostile_dps[tid], -A.per_track[tid].d)
+            v = (seen_first and not tr.est, hostile_dps[tid], -A.per_track[tid].d)   # E4: a mech we can see first
             if mv is None or v > mv:
                 mt, mv = tid, v
         A.main_threat_id = mt
@@ -646,10 +669,18 @@ class Assessor:
         A.target_id = self._pick_target(world, A, t)
         sum_h = sum(hostile_dps.values())
         A.ttk_them_on_us = hp_us / sum_h if sum_h > 0 else INF
+        sum_e = sum(A.per_track[i].dps_to_us_entry for i in hostile_dps)
+        A.ttk_them_on_us_entry = hp_us / sum_e if sum_e > 0 else INF
         if A.target_id is not None:
             ta = A.per_track[A.target_id]
             A.ttk_us_on_target = ta.ttk_us_on_j
             A.A = _ratio(A.ttk_them_on_us, ta.ttk_us_on_j)
+            se = sum_e + (0.0 if A.target_id in hostile_dps else ta.dps_to_us_entry)
+            ours_t = self._dps_from_entry.get(A.target_id, 0.0)
+            A.A_entry = _ratio(hp_us / se if se > 0 else INF,
+                               self._hp_eff[A.target_id] / ours_t if ours_t > 0 else INF)
+            if C.ENGAGE_MODEL == "live":
+                A.A_entry = A.A                 # "live": no E1, entry uses the live ratio exactly
             if me.playbook == "PB_L" and ta.d > C.LIGHTNING_RANGE:
                 A.A_rush = self.a_rush_for(world, A, A.target_id)
         # threats
@@ -733,7 +764,7 @@ class Assessor:
             return self._our_dps(world, tr, s, s3, True, False, False, energy=e)
 
         drain = _f(me.stats.get("boost_drain"), _f(C.path("mech.boost_drain", 17), 17.0))
-        return a_rush(C, d, boost - max(0.0, retreat), hp_eff_self(me), hp_eff_enemy(tr, C), me.energy, drain,
+        return a_rush(C, d, boost - max(0.0, retreat), hp_self(me), hp_eff_enemy(tr, C), me.energy, drain,
                       us_on_j, j_on_us, other)
 
     def _rush_exempt(self, world, tr, ta, macro: str, target_id, sub: str) -> bool:
@@ -755,21 +786,30 @@ class Assessor:
         still = tr.still_since is not None and t - tr.still_since >= C.STILL_MIN_S
         return d <= C.LIGHTNING_RUSH_STILL_R and (still or tr.reloading_until > t)
 
-    def a_vs(self, world, track_id: int, hostiles: Optional[List[int]] = None) -> float:
-        """A vs track_id with H = `hostiles` (None -> that track alone), from the last update."""
+    def a_vs(self, world, track_id: int, hostiles: Optional[List[int]] = None, entry: bool = False) -> float:
+        """A vs track_id with H = `hostiles` (None -> that track alone), from the last update.
+        entry=True uses the 8.2.1 engage assumptions (A_entry: aiming at us, no reload/rear discounts)."""
         me = world.me
         A = self.last
+        entry = entry and self.C.ENGAGE_MODEL != "live"      # "live": no E1
         ta = A.per_track.get(track_id)
         if ta is None:
             return 0.0
         hs = [track_id] if hostiles is None else hostiles
         tot = 0.0
         for h in hs:
-            if h == track_id:
+            pa = A.per_track.get(h)
+            if entry:
+                tot += pa.dps_to_us_entry if pa is not None else 0.0
+            elif h == track_id:
                 tot += ta.dps_to_us
             else:
-                tot += self.hostile_dps.get(h, A.per_track[h].dps_to_us if h in A.per_track else 0.0)
-        ttk_them = hp_eff_self(me) / tot if tot > 0 else INF
+                tot += self.hostile_dps.get(h, pa.dps_to_us if pa is not None else 0.0)
+        ttk_them = hp_self(me) / tot if tot > 0 else INF
+        if entry:
+            ours = self._dps_from_entry.get(track_id, 0.0)
+            ttk_us = self._hp_eff.get(track_id, 0.0) / ours if ours > 0 else INF
+            return _ratio(ttk_them, ttk_us)
         return _ratio(ttk_them, ta.ttk_us_on_j)
 
     # ------------------------------------------------------------------ 8.6 drop go/no-go
@@ -874,12 +914,25 @@ class Assessor:
             if in_x2:
                 since = ctx.get("x2_since")
                 since = -INF if since is None else since
+                third_dps = 0.0
                 for o in world.tracks.values():
                     if o.kind != "mech" or o.id == tid:
                         continue
                     x = world.tx.get(o.id)
                     vis_new = o.visible and x is not None and x.vis_since is not None and x.vis_since >= since
                     if vis_new or (o.last_damaged_us_t >= since and t - o.last_damaged_us_t <= C.SELF_DEFENSE_S):
+                        pa = A.per_track.get(o.id)
+                        if C.THIRD_PARTY_RULE == "summed" and ta is not None and pa is not None:
+                            # D12: the fight goes on while A against the target stays >= HOLD_A_MIN with the
+                            # third mechs' DPS on us added to every hostile's. A third mech counts as aiming
+                            # at us (8.2.1: it turns on us within about a second), and the ones that pass
+                            # stay in the sum, so two weak arrivals can end the fight together.
+                            third_dps += max(0.0, pa.dps_to_us_entry - self.hostile_dps.get(o.id, 0.0))
+                            tot = sum(self.hostile_dps.values()) + third_dps
+                            if tid not in self.hostile_dps:
+                                tot += ta.dps_to_us
+                            if _ratio(hp_self(me) / tot if tot > 0 else INF, ta.ttk_us_on_j) >= C.HOLD_A_MIN:
+                                continue
                         lose.add("c")
                         lt.setdefault("c", o.id)
                         break
@@ -944,18 +997,33 @@ class Assessor:
                 o = world.tracks[th_id]
                 kinds = self._enemy_kinds(world, o, pa.d, pa.d3, pa.los)
                 rch = max([weapon_reach(k, enemy_wstats(C, k), C, o.lightning_range_mult) for k in kinds] or [0.0])
-                fe.t_close = max(0.0, pa.d - rch) / max(C.IMPL_MIN_SPEED, pa.closing_speed)
                 wd = self._wall_dist(me.pos[0], me.pos[1])
-                cover_eta = ctx.get("cover_eta")
+                e2 = C.ENGAGE_MODEL != "live"          # "live": 8.2.6 as it was before E2
+                walk = max(C.IMPL_MIN_SPEED, _f(me.stats.get("walk_speed"), self.walk) if e2 else self.walk)
+                cover_eta = ctx.get("cover_eta") if e2 else None
                 if cover_eta is None:
-                    cover_eta = (wd / max(C.IMPL_MIN_SPEED, self.walk)) if (wd is not None and wd <= C.COVER_SEARCH_R) else INF
-                no_break = pa.in_its_reach and (wd is None or wd > C.COVER_DASH_R)
-                enter = cover_eta >= fe.t_close or no_break
+                    cover_eta = (wd / walk) if (wd is not None and wd <= C.COVER_SEARCH_R) else INF
+                ranged = any(k in ("gun", "laser", "mortar") for k in kinds)
+                if e2 and ranged and pa.d <= rch:
+                    # E2 (early-death fix): a gun/laser/mortar threat already inside its reach. Time to
+                    # close is 0 here, so the original test called every ranged duel "cornered". Escape
+                    # budget = CORNER_TTK_FRAC x our time to die (engage assumptions); escape = reach
+                    # cover, or walk out of its reach.
+                    fe.t_close = C.CORNER_TTK_FRAC * A.ttk_them_on_us_entry
+                    esc = min(cover_eta, max(0.0, rch - pa.d) / walk)
+                    no_break = False
+                else:
+                    fe.t_close = max(0.0, pa.d - rch) / max(C.IMPL_MIN_SPEED, pa.closing_speed)
+                    esc = cover_eta
+                    no_break = pa.in_its_reach and (wd is None or wd > C.COVER_DASH_R)
+                if e2:
+                    fe.cover_eta = esc
+                enter = esc >= fe.t_close or no_break
                 if cornered_active:
                     if self._cornered_since is None:
                         self._cornered_since = t
                     held_long = t - self._cornered_since >= C.CORNER_MIN_HOLD_S
-                    fe.cornered = not (held_long and cover_eta < fe.t_close - C.CORNER_COVER_MARGIN_S)
+                    fe.cornered = not (held_long and esc < fe.t_close - C.CORNER_COVER_MARGIN_S)
                 else:
                     fe.cornered = enter
                     self._cornered_since = t if enter else None
@@ -1035,10 +1103,13 @@ class Assessor:
             rule, sub = "RG1", "DUEL_GUN"
             if not in_x2:
                 a_min = a_min + C.PB_G_A_EXTRA          # RG1 entry; X2 persists at HOLD_A_MIN (H2)
+        # E1: entering a fight uses the engage ratio A_entry; holding one (X2) uses the live A
+        a_now = (A.A if in_x2 else A.A_entry) if tid == A.target_id else None
         if ok and a_gate and rule not in ("RL1", "R10.2"):
-            a_gate = A.A >= a_min if tid == A.target_id else self.a_vs(world, tid, A.hostiles + ([] if tid in A.hostiles else [tid])) >= a_min
+            a_gate = (a_now if a_now is not None else
+                      self.a_vs(world, tid, A.hostiles + ([] if tid in A.hostiles else [tid]), entry=not in_x2)) >= a_min
         elif ok and rule == "RL1" and d <= C.LIGHTNING_RANGE:
-            a_gate = A.A >= a_min if tid == A.target_id else self.a_vs(world, tid) >= a_min
+            a_gate = (a_now if a_now is not None else self.a_vs(world, tid, entry=not in_x2)) >= a_min
         if not (ok and a_gate):
             fe.win_rule = rule if rule == "R10.1" else ""
             return fe
@@ -1049,7 +1120,11 @@ class Assessor:
         if ctx.get("committed_capture"):
             return fe
         hurt = world.damaged_us_recently(tid, C.SELF_DEFENSE_S)
-        if (t < C.LOOT_END_T or ctx.get("neighbor") == tid) and not (hurt or A.A >= C.EARLY_FIGHT_A_MIN):
+        if C.ENGAGE_MODEL == "live":
+            a_early = A.A                              # "live": before E1 the veto used A.A for any tid
+        else:
+            a_early = A.A_entry if tid == A.target_id else self.a_vs(world, tid, entry=True)
+        if (t < C.LOOT_END_T or ctx.get("neighbor") == tid) and not (hurt or a_early >= C.EARLY_FIGHT_A_MIN):
             return fe
         if macro not in ("X2", "X3"):
             seen = [o for o in world.tracks.values() if o.kind == "mech" and t - o.last_seen_t <= C.HIDE_CLEAR_S]

@@ -4,6 +4,8 @@
 .omc
 .dockerignore
 tools/
+runs/
+.ruff_cache/
 tests/
 docs/
 *.md

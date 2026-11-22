@@ -431,6 +431,11 @@ class Modes:
                "x3_since": self.x3_since if self.macro == "X3" else None,
                "alive": world.tick.alive, "cornered_active": self.macro == "X2" and self.sub == "CORNERED",
                "sub": self.sub if self.macro == "X2" else ""}
+        if self.cover_point is not None and self.cover_point[0] is not None:   # E2: escape ETA to our cover point
+            cp = self.cover_point[0]
+            me = world.me
+            walk = max(C.IMPL_MIN_SPEED, float(me.stats.get("walk_speed", 11.7) or 11.7))
+            ctx["cover_eta"] = math.hypot(cp[0] - me.pos[0], cp[1] - me.pos[1]) / walk * C.ZONE_ETA_SAFETY
         fe = FightEval()
         if self.assessor is not None:
             fe = self.assessor.evaluate_fight(world, A, self.macro, target, ctx)
@@ -580,7 +585,12 @@ class Modes:
             return
         if m == "X3":
             if fv.cornered:                                                      # 8.2.6 -> X2 CORNERED
-                self.target = self.x3_threat if self.x3_threat is not None else fv.target_id
+                # E4: fight back at a mech we can see and hit; the X3 trigger track may be an unseen,
+                # damage-inferred estimate we cannot shoot (VISIBLE_THREAT_FIRST False: the X3 threat, as before E4)
+                vis = A.target_id if (C.VISIBLE_THREAT_FIRST and A.target_id is not None
+                                      and A.target_id in world.tracks
+                                      and world.tracks[A.target_id].visible) else None
+                self.target = vis if vis is not None else (self.x3_threat if self.x3_threat is not None else fv.target_id)
                 self._enter_macro("X2", "CORNERED", t, "R6.2", self.target)
                 intent.trace.append("R6.2")
                 return
@@ -624,6 +634,13 @@ class Modes:
         if self.sub not in ("CORNERED", "ROOF_ASSAULT") and A.target_id is not None and A.target_id != j:
             self.target = j = A.target_id
             self.x2_range_loss_since = None
+        elif C.VISIBLE_THREAT_FIRST and self.sub == "CORNERED" and A.target_id is not None and A.target_id != j:
+            # E4: in CORNERED, swap an unseen target for the visible one we can actually hit
+            # (VISIBLE_THREAT_FIRST False: CORNERED keeps its target, as before E4)
+            cur = world.tracks.get(j) if j is not None else None
+            nxt = world.tracks.get(A.target_id)
+            if (cur is None or not cur.visible) and nxt is not None and nxt.visible:
+                self.target = j = A.target_id
         tr = world.tracks.get(j) if j is not None else None
         killed = any(ev.get("type") == "kill" and ev.get("target") == j for ev in world.events or ())
         if j is None or tr is None or killed or t - tr.last_seen_t > C.TARGET_LOST_S:
@@ -770,10 +787,11 @@ class Modes:
                 or (self.e_los_broken_since is not None and t - self.e_los_broken_since >= C.DISENGAGE_CLEAR_S))
 
     # ============================================================== shared actuator helpers
-    def legs(self, ctx, rule, direction, speed=1.0, goal=None, juke_ok=True, level=None) -> None:
-        """The single owner LegRequest of this tick (X4, L5, L6, L7 or L8)."""
+    def legs(self, ctx, rule, direction, speed=1.0, goal=None, juke_ok=True, level=None, nav=False) -> None:
+        """The single owner LegRequest of this tick (X4, L5, L6, L7 or L8). nav=True: the direction comes from
+        the navigation layer (go / zone_go) and is not dropped by the leg clearance probe."""
         lvl = level or self._owner_level
-        ctx.intent.legs.append(LegRequest(lvl, rule, direction, speed, goal, juke_ok))
+        ctx.intent.legs.append(LegRequest(lvl, rule, direction, speed, goal, juke_ok, nav=nav))
         self._leg_writes += 1
 
     def aim_track(self, ctx, prio_name, rule, tr, tiebreak=0.0, kind=None) -> Optional[AimRequest]:
@@ -836,16 +854,28 @@ class Modes:
             st = None
         if st is None:
             d = unit(g[0] - me.pos[0], g[1] - me.pos[1])
-            st = Steer(d, arrived=d is None)
+            st = Steer(d, arrived=d is None, rule="8.9f")      # a raw line: the arbiter's probe still vets it
         if st.jump:
             ctx.intent.jump.append(JumpRequest("CLIMB", "R13.2"))
         if st.climb_boost:
             ctx.intent.boost.append(BoostRequest("CLIMB", "R13.2", True, 0.0))
         return st
 
+    def zone_go(self, ctx) -> Steer:
+        """nav.zone_steer: the way into the zone, with the jump / climb it needs as requests (like go())."""
+        try:
+            st = ctx.nav.zone_steer(ctx.world.me, ctx.world.tick.t)
+        except Exception:
+            st = Steer(None)
+        if st.jump:
+            ctx.intent.jump.append(JumpRequest("CLIMB", st.rule))
+        if st.climb_boost:
+            ctx.intent.boost.append(BoostRequest("CLIMB", st.rule, True, 0.0))
+        return st
+
     def walk_to(self, ctx, key, rule, goal, speed=1.0, silent=False, juke_ok=True) -> Steer:
         st = self.go(ctx, key, goal, silent)
-        self.legs(ctx, rule, st.direction, speed, goal, juke_ok)
+        self.legs(ctx, rule, st.direction, speed, goal, juke_ok, nav=st.rule != "8.9f")
         return st
 
     def take(self, ctx, writer, rule, pickup_id, drop=None) -> None:
@@ -893,7 +923,10 @@ class Modes:
         mt = world.tracks.get(A.main_threat_id) if A.main_threat_id is not None else tr
         self.aim_track(ctx, "AIM5", "AIM5", mt or tr)
         if tr is None:
-            self.legs(ctx, "X3", None)
+            # nothing left to flee from: do not stand in the open while the zone closes (49 s of this, then
+            # a zone death, in minisim --peace seed 801); walk the zone field until X3's own exit
+            zd = self.zone_go(ctx).direction
+            self.legs(ctx, "X3", zd, 1.0, None, juke_ok=False, nav=True)
             return "X3"
         m = tr.lightning_range_mult or 1.0
         light_threat = has_weapon(tr, "lightning", C.CONF_SOUND)
@@ -911,7 +944,7 @@ class Modes:
                     away = unit(me.pos[0] - tr.pos[0], me.pos[1] - tr.pos[1]) or (1.0, 0.0)
                     self.legs(ctx, rule, perp(away, 1), 1.0, pt, juke_ok=False)
                 else:
-                    self.legs(ctx, rule, st.direction, 1.0, pt, juke_ok=False)
+                    self.legs(ctx, rule, st.direction, 1.0, pt, juke_ok=False, nav=st.rule != "8.9f")
             else:
                 away = unit(me.pos[0] - tr.pos[0], me.pos[1] - tr.pos[1])
                 self.legs(ctx, rule, away, 1.0, None, juke_ok=False)       # backpedal straight away
@@ -925,10 +958,20 @@ class Modes:
         # BREAK_LOS (general; R6.3 for LOSE (i)): path to the best cover point blocking all threats, backpedal
         rule = "R6.3" if "i" in self.x3_entry else "X3:" + ("".join(sorted(self.x3_entry)) or "-")
         threats = [world.tracks[i] for i in (A.hostiles or ()) if i in world.tracks] or [tr]
-        pt = self._cover_point(ctx, threats, C.DISENGAGE_MAX_S)
-        if pt is not None:
+        # LOSE (d) alone: we left the fight for the zone, so the way out is the way in. Heading for cover
+        # here stood still at slack 5 s until O1 took the legs, then again (minisim --peace seed 801).
+        zone_dir = None
+        if self.x3_entry == frozenset("d"):
+            zone_dir = self.zone_go(ctx).direction
+        pt = None if zone_dir is not None else self._cover_point(ctx, threats, C.DISENGAGE_MAX_S)
+        if zone_dir is not None:
+            self.legs(ctx, rule, zone_dir, 1.0, None, juke_ok=False, nav=True)
+        elif pt is not None:
             st = self.go(ctx, "x3", pt, exposure=True)
-            self.legs(ctx, rule, st.direction, 1.0, pt, juke_ok=True)
+            # E3 (GP juking, KEEP): "Don't juke ... while running to cover (straight is faster)";
+            # COVER_RUN_JUKE "juke": this leg may juke (O7), as before E3
+            self.legs(ctx, rule, st.direction, 1.0, pt, juke_ok=C.COVER_RUN_JUKE == "juke",
+                      nav=st.rule != "8.9f")
         else:
             away = unit(me.pos[0] - tr.pos[0], me.pos[1] - tr.pos[1])
             self.legs(ctx, rule, away, 1.0, None)
@@ -1204,22 +1247,23 @@ class Modes:
 
     def _r_M2U(self, ctx, gs) -> str:
         C, me = self.C, ctx.world.me
-        d = None
-        try:
-            d = ctx.nav.zone_descent(me.pos)
-        except Exception:
-            d = None
+        zs = self.zone_go(ctx)
+        d = zs.direction
+        from_nav = d is not None
+        hold = d is None and zs.rule == "R13.2w"             # at the foot of a climb, waiting for the energy it costs
         zone = ctx.world.zone
-        if d is None:
+        if d is None and not hold:
             d = unit(zone.next_center[0] - me.pos[0], zone.next_center[1] - me.pos[1])
         inside = hdist(me.pos, zone.next_center) < max(0.0, zone.next_radius - C.ZONE_EDGE_MARGIN_M)
         if inside and self.spot is not None:
             self.walk_to(ctx, "m2u", "M2U", self.spot[0])
         else:
-            self.legs(ctx, "M2U", d, 1.0)
+            self.legs(ctx, "M2U", d, 1.0, nav=from_nav)
             if d is not None:
                 self.aim_dir(ctx, "AIM9", "M2U", math.atan2(d[1], d[0]))
-        self.boost(ctx, "M2U", ctx.world.me.energy > C.BOOST_FLOOR_TRAVEL, C.BOOST_FLOOR_TRAVEL)
+        # no ground sprint on the way to a climb: the energy is what the climb costs
+        self.boost(ctx, "M2U", ctx.world.me.energy > C.BOOST_FLOOR_TRAVEL and not zs.rule.startswith("R13.2"),
+                   C.BOOST_FLOOR_TRAVEL)
         return "M2U"
 
     # ---- M6 RECOVER

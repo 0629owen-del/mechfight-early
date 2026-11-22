@@ -6,6 +6,8 @@ run(sub, ctx) -> rule                        R8.2 (APPROACH/WATCH), R8.5 (CAPTUR
 
 H6 re-checks of the go test apply in APPROACH and WATCH; inside CAPTURE the ring rules decide (R8.3/R8.4
 occupancy, R8.5 damage abort), so an intruder near (not in) the ring does not end a committed capture.
+CAPTURE walks the nav path until it is inside the ring (it used to walk a straight line).
+DROP_TIMEOUT_S counts from the landing time (world keeps lands_at fixed once down).
 """
 from __future__ import annotations
 
@@ -99,7 +101,12 @@ def check_exit(ctx, gs):
             return ("contested" if others >= 2 else "occupied"), abandon               # R8.3 / R8.4
         if dr.holder is not None and dr.holder != me.id and last is not None and prog > last:
             return "occupied", abandon
-        if t - dr.lands_at >= C.DROP_TIMEOUT_S:
+        # our capture clock is running: let it finish. check_exit runs before run() in a decision, so prog_t is
+        # last tick's; a first CAPTURE tick has none (counts as fresh). Frozen for max(DROP_STALL_S, capture_s)
+        # (the 1 s probe alone is too tight for coarse progress updates) means something else holds the clock.
+        stalled = t - gs.data.get("prog_t", t) >= max(C.DROP_STALL_S, dr.capture_s)
+        ours = dr.holder == me.id and prog > 0.0 and not stalled
+        if t - dr.lands_at >= C.DROP_TIMEOUT_S and not ours:
             return "timeout", ExitMemory.PERMANENT
     sub = ctx.modes.sub
     if sub == "CAPTURE":
@@ -159,6 +166,10 @@ def run(sub: str, ctx) -> str:
     if any(s.band == "near" for s in (world.sounds or ())):
         gs.data["near_sound_t"] = t
     ready = dr.lands_in <= C.DROP_ENTER_LEAD_S and clear and quiet
+    # CAPTURE commits when the drop is down and the ring is clear and quiet, wherever we are. A gate on
+    # distance was tried on 2026-11-21 and cost captures (41 -> 30 in 90 matches): commitment is what wins
+    # drops. What was wrong was the walk, a straight line into the nearest wall; CAPTURE now follows the
+    # nav path until it is inside the ring, and DROP_TIMEOUT_S ends a capture that cannot be reached.
     if sub in ("APPROACH", "WATCH") and ready:
         sub = m.sub = "CAPTURE"
         gs.data["cap_t"] = t
@@ -182,14 +193,17 @@ def run(sub: str, ctx) -> str:
     # CAPTURE (R8.5): stay inside radius - DROP_RING_MARGIN, strafe randomly inside
     r_in = max(0.5, dr.radius - C.DROP_RING_MARGIN)
     dd = M.hdist(me.pos, dr.pos)
-    if dd > r_in * 0.6:
-        direction = M.unit(dr.pos[0] - me.pos[0], dr.pos[1] - me.pos[1])
+    if dd > dr.radius:                                                 # still outside the ring: follow the path
+        m.walk_to(ctx, "m7", "R8.5", (dr.pos[0], dr.pos[1]))
     else:
-        if t - gs.data.get("strafe_t", -1e9) >= 0.5:
-            gs.data["strafe_t"] = t
-            gs.data["strafe_a"] = ctx.rng.uniform(-math.pi, math.pi)
-        direction = M.yaw_vec(gs.data.get("strafe_a", 0.0))
-    m.legs(ctx, "R8.5", direction, 1.0, (dr.pos[0], dr.pos[1]))
+        if dd > r_in * 0.6:
+            direction = M.unit(dr.pos[0] - me.pos[0], dr.pos[1] - me.pos[1])
+        else:
+            if t - gs.data.get("strafe_t", -1e9) >= 0.5:
+                gs.data["strafe_t"] = t
+                gs.data["strafe_a"] = ctx.rng.uniform(-math.pi, math.pi)
+            direction = M.yaw_vec(gs.data.get("strafe_a", 0.0))
+        m.legs(ctx, "R8.5", direction, 1.0, (dr.pos[0], dr.pos[1]))
     mt = world.tracks.get(A.main_threat_id) if A.main_threat_id is not None else None
     if mt is not None and mt.visible:
         m.aim_track(ctx, "AIM9", "R8.5", mt)
@@ -200,8 +214,9 @@ def run(sub: str, ctx) -> str:
             break
     # A-6: progress stalls with only an NPC inside -> kill it (R7.2 gates relaxed)
     prog = dr.progress
-    if prog > gs.data.get("prog", -1.0):
-        gs.data["prog"], gs.data["prog_t"] = prog, t
+    if prog > gs.data.get("prog", -1.0):                               # rose since last tick (a reset restarts at 0)
+        gs.data["prog_t"] = t
+    gs.data["prog"] = prog
     if t - gs.data.get("prog_t", t) >= C.DROP_STALL_S:
         for tr in world.tracks.values():
             if tr.kind == "npc" and tr.visible and M.hdist(tr.pos, dr.pos) <= dr.radius:

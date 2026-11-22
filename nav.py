@@ -72,6 +72,7 @@ SIDE_WALL = 2.4          # side sample this much above the centre line = wall be
 CLIMB_START_R = 1.6      # start the climb sequence within this distance of the face stand point
 CLIMB_TIMEOUT_S = 7.0
 ZONE_SEED_BAND = 6.0     # S cells this close to the S boundary seed the reverse Dijkstra (> 4*sqrt2)
+WIDE_FIELD_EXTRA_S = 15.0   # a widened zone field stops this many seconds of travel past our own cell
 
 _DEF = {
     "NAV_MS_CAP": 10, "RANK_MS_CAP": 3, "ZONE_FIELD_MS": 8, "ZONE_FIELD_MIN_MS": 4, "ANYTIME_RESERVE_MS": 2,
@@ -79,13 +80,15 @@ _DEF = {
     "ZONE_SOFT_MULT": 2, "ZONE_SLACK_SOFT_S": 15, "ZONE_SLACK_HARD_S": 4,
     "STEP_UP": 1.2, "JUMP_H": 2.75, "NAV_FLOOD_R": 150, "NAV_FLOOD_REFRESH_S": 2,
     "ASTAR_MAX_EXPANSIONS": 20000, "LOOKAHEAD_M": 6, "WAYPOINT_REACH_M": 2.5, "NAV_CLEAR_PAD": 0.3,
-    "NAV_HEAD_PAD": 0.3, "SLOPE_COST_K": 1.0, "JUMP_EDGE_COST_S": 0.5, "CLIMB_EDGE_PAD_S": 0.8,
+    "NAV_HEAD_PAD": 0.3, "SIZE_TIGHT_COST_S": 1.0, "SIZE_TIGHT_ENTER_COST_S": 8.0,
+    "SLOPE_COST_K": 1.0, "JUMP_EDGE_COST_S": 0.5, "CLIMB_EDGE_PAD_S": 0.8,
     "EXPOSURE_COST_S": 0.5, "EXPOSURE_LOS_CHECKS": 120, "IMPL_EXPOSURE_CACHE_M": 8,
     "HEAT_COST_S": 2, "ZONE_CELL_COST_S": 5, "SILENT_MOVE": 0.41,
     "STUCK_SPEED": 1.5, "STUCK_T": 0.8, "STUCK_MOVE_MIN": 0.5, "UNSTUCK_OK_SPEED": 3,
     "UNSTUCK_OK_S": 0.5, "UNSTUCK_STEP_S": 0.6, "UNSTUCK_JET_MAX_S": 1.5, "UNSTUCK_JET_MIN_ENERGY": 20,
     "NAV_BLOCK_TTL_S": 30, "NAV_RECOVER_MAX_S": 4, "STUCK_REPEAT_N": 3, "STUCK_REPEAT_WINDOW_S": 10,
     "ESCAPE_MIN_M": 10, "ESCAPE_MAX_M": 20,
+    "STUCK_PACE_S": 4, "STUCK_PACE_M": 3, "ZONE_CLIMB_IDLE_S": 1, "WEDGE_REPEAT_N": 2, "WEDGE_MOVE_M": 0.5, "WEDGE_JET_MAX_S": 3,
     "CLIMB_COST_PER_M": 1.5, "CLIMB_COST_PAD": 3, "CLIMB_NAV_RESERVE": 20, "CLIMB_MAX_H": 51,
     "CLIMB_CLEAR_M": 0.5, "CLIMB_ABORT_ENERGY": 5, "JUMP_TRIGGER_DIST_M": 1.5,
     "ROOF_MIN_H": 10, "ROOF_MAX_H": 30, "ROOF_MIN_W": 20, "ROOF_ESCAPE_RESERVE": 30,
@@ -170,7 +173,7 @@ class _Search:
     __slots__ = ("kind", "key", "dist", "prev", "closed", "etype", "face", "heap", "goal_cell",
                  "gi", "gj", "hs", "oi", "oj", "rad2", "inv", "jcost", "pen", "climbs", "energy",
                  "reserve", "max_climb_h", "done", "found", "exp", "max_exp", "best", "best_h",
-                 "origin", "origin_cell", "goal", "start", "radius", "created_t", "cost")
+                 "origin", "origin_cell", "goal", "start", "radius", "created_t", "cost", "tight_open", "troot")
 
     def __init__(self, N):
         self.dist = array.array("d", [INF]) * N
@@ -192,6 +195,8 @@ class _Search:
         self.max_exp = 1 << 30
         self.best = -1
         self.best_h = INF
+        self.tight_open = False   # False: a tight cell is entered only from a tight cell
+        self.troot = None         # closed mode: 1 = cell on a tight chain rooted at the origin (else None)
 
 
 class _PathJob:
@@ -217,7 +222,7 @@ class _PathJob:
 
 class _ZoneField:
     __slots__ = ("sx", "sy", "sr", "tiny", "rx", "ry", "rr", "d", "closed", "inr", "heap", "phase",
-                 "row", "rows", "climbs", "scells", "inv", "pops")
+                 "row", "rows", "climbs", "scells", "inv", "pops", "wide", "want", "stop_g")
 
     def __init__(self, N):
         self.d = array.array("d", [INF]) * N
@@ -230,6 +235,9 @@ class _ZoneField:
         self.climbs = False
         self.scells = None
         self.pops = 0
+        self.wide = False
+        self.want = -1            # wide fields: our cell; the run stops WIDE_FIELD_EXTRA_S past it
+        self.stop_g = INF
 
 
 # ======================================================================= Nav
@@ -273,6 +281,8 @@ class Nav:
         self.energy = self.max_energy
         self.s = 1.0
         self._pos = (0.0, 0.0, 0.0)
+        self._pos_seen = False           # a real position has been synced (the zone field widens only then)
+        self._descend_face = None        # climb face of the last _descend step, if that step was a climb
         self._t = 0.0
         self._world = None
         self._zone: Optional[ZoneState] = None
@@ -294,11 +304,18 @@ class Nav:
         # climb in progress
         self._climb = None
         self._hop = None
+        self.leg_nav = True              # the last executed leg direction came from nav (arbiter writes it)
+        self._zs_cache = None            # (key, Steer) of the last zone_steer call
         # stuck ladder
         self._stuck = {"active": False, "slow_since": None, "ok_since": None, "start": 0.0,
                        "dir": (1.0, 0.0), "steps": [], "episodes": [], "pos0": None,
                        "escape": None, "blocked": False, "jet_top": 0.0, "side_first": 1,
-                       "step_name": None}
+                       "step_name": None, "pace_t0": None, "pace_p0": None, "pace": False,
+                       "limit": 0.0, "wedge_p0": None, "wedge_n": 0, "lift_dir": None, "lift_top": 0.0,
+                       "lift_end": None}
+        self._stuck_exempt_t = None      # match time of the last decision that pressed on purpose (stuck_exempt)
+        # a press declared longer ago than this is not the command stuck_update is judging (one decision apart)
+        self._stuck_exempt_age = 1.5 * float(getattr(C, "AIM_LATENCY_S", 0.1) or 0.1)
         self._last_follow_key = None
         # spots
         self._spot_jobs: Dict[str, object] = {}
@@ -394,6 +411,7 @@ class Nav:
             return
         try:
             self._pos = tuple(me.pos)
+            self._pos_seen = True
             stt = me.stats or {}
             self.walk = float(stt.get("walk_speed", self.walk))
             self.rise = float(stt.get("max_rise_speed", self.rise))
@@ -424,18 +442,27 @@ class Nav:
         self._sync_me(getattr(world, "me", None))
 
     def _cell_status(self, c):
-        """R12.3: 1 ok / 2 blocked for the current size (clearance and underpass head room)."""
+        """R12.3 for the current size: 1 ok, 2 blocked (underpass head room), 3 tight (clearance).
+
+        Tight cells are for getting out, not for going through: a move between two tight cells costs
+        SIZE_TIGHT_COST_S, a move into one from open ground costs SIZE_TIGHT_ENTER_COST_S but only in an
+        "open" search (tight_open: the A* retry and the widened zone field), and moves out are free. They used to be closed outright, which cut every cliff foot and wall side
+        out of the graph after the first cube: a search started there found no neighbour, the bot paced
+        along the wall on interim steering and died to the zone (minisim seed 503 at 2 mechs, seeds 176
+        and 184 at 16). Making them nearly free was tried too and routed grown mechs into notches they
+        could not pass (--peace seeds 801, 803); allowing them only from inside left whole areas with no
+        way out for a 5-cube mech (the ridge west of the centre)."""
         md = self.md
-        ok = True
+        st = 1
         if self._F[c] & F_UNDER and self._U[c] * 0.1 < self.height + self._NAV_HEAD_PAD:
-            ok = False
-        if ok and self.radius > MECH_R + 0.05:
+            st = 2
+        elif self.radius > MECH_R + 0.05:
             x, y = md.cell4_xy(c)
-            # the nav4 edge test assumes a 2.5 m body: need the extra radius around the centre
+            # the nav4 edge test assumes a 2.5 m body: the extra radius is wanted around the centre
             if md.clearance(x, y) < (self.radius - MECH_R) + 1.0:
-                ok = False
-        self._cst[c] = 1 if ok else 2
-        return self._cst[c]
+                st = 3
+        self._cst[c] = st
+        return st
 
     # ------------------------------------------------------------------ small geometry helpers
     def cell_xy(self, c) -> Vec2:
@@ -491,10 +518,11 @@ class Nav:
             return nav[j * md.nx + i] * 0.01
         return None
 
-    def _rise_ok(self, x0, y0, x1, y1, half_w, max_side=SIDE_WALL):
+    def _rise_ok(self, x0, y0, x1, y1, half_w, max_side=SIDE_WALL, floor=None):
         """Walkable straight line: consecutive 1 m rises <= STEP_UP on the centre line and on two
         lines offset +-half_w, no side sample > SIDE_WALL above the centre sample, in bounds.
-        Drops of any height are allowed (falling is free)."""
+        Drops of any height are allowed (falling is free). floor (m): the feet height; ground below it
+        counts as being at it (a wall whose top is within STEP_UP of the feet is not a wall)."""
         nav = self._nav1 if self._nav1 is not None else self._ensure_nav1()
         md = self.md
         nx, ny, gx0, gy0 = md.nx, md.ny, md.gx0, md.gy0
@@ -507,6 +535,7 @@ class Nav:
         px, py = -uy * half_w, ux * half_w
         su = int(self._STEP_UP * 100) + 5
         sw = int(max_side * 100)
+        fl = None if floor is None else int(floor * 100)
         prev = [None, None, None]
         b = md.bounds
         for s in range(n + 1):
@@ -522,6 +551,8 @@ class Nav:
                 if not (0 <= i < nx and 0 <= j < ny):
                     return False
                 h = nav[j * nx + i]
+                if fl is not None and h < fl:
+                    h = fl
                 if li == 0:
                     cur = h
                 elif h - cur > sw:
@@ -561,7 +592,8 @@ class Nav:
 
     def clear_dir(self, pos: Vec3, direction: Vec2, dist: float) -> bool:
         """Leg probe (6.3): moving `dist` m along `direction` (plus the body radius) meets no wall
-        (rise > STEP_UP between 1 m samples on the centre line or +-0.7 R), no map edge."""
+        (rise > STEP_UP between 1 m samples on the centre line or +-0.7 R), no map edge. Height-aware:
+        ground below our feet counts as being at our feet (protocol 7: a wall is a wall only above them)."""
         try:
             dx, dy = direction
             ln = math.hypot(dx, dy)
@@ -570,7 +602,8 @@ class Nav:
             dx, dy = dx / ln, dy / ln
             x0, y0 = pos[0], pos[1]
             L = dist + self.radius
-            return self._rise_ok(x0, y0, x0 + dx * L, y0 + dy * L, 0.7 * self.radius, max_side=1e9)
+            return self._rise_ok(x0, y0, x0 + dx * L, y0 + dy * L, 0.7 * self.radius, max_side=1e9,
+                                 floor=pos[2] if len(pos) > 2 else None)
         except (TypeError, ValueError):
             self.exceptions += 1
             return True
@@ -713,9 +746,17 @@ class Nav:
             pass
         return _RANGE_DEF.get(kind, 200.0)
 
-    def _new_search(self, kind, start_cell, cost, radius=0.0, goal_cell=-1, goal=None):
+    def _new_search(self, kind, start_cell, cost, radius=0.0, goal_cell=-1, goal=None, tight_open=False):
         s = _Search(self.N)
         s.kind = kind
+        s.tight_open = tight_open
+        if not tight_open and self._size_check:
+            # a closed search walks tight -> tight only from a tight origin (a way out of a wall side);
+            # a tight cell entered by a climb landing can only be left onto open ground
+            cst0 = self._cst
+            if (cst0[start_cell] or self._cell_status(start_cell)) == 3:
+                s.troot = bytearray(self.N)
+                s.troot[start_cell] = 1
         s.cost = cost or {}
         speed = self.walk
         silent = bool(s.cost.get("silent"))
@@ -758,6 +799,9 @@ class Nav:
         blocked = self._blocked if self._blocked else None
         cst = self._cst if self._size_check else None
         cell_status = self._cell_status
+        tight_s, enter_s = self._SIZE_TIGHT_COST_S, self._SIZE_TIGHT_ENTER_COST_S
+        t_open = s.tight_open
+        troot = s.troot
         pop, push = heapq.heappop, heapq.heappush
         expired = sl.expired if sl is not None else None
         bits8, dlen = BITS8, DLEN
@@ -789,23 +833,32 @@ class Nav:
             bits = w | J[c]
             if bits:
                 hc = H[c]
+                c_tight = cst is not None and (cst[c] or cell_status(c)) == 3
                 for k in bits8[bits]:
                     v = c + OFF[k]
                     if closed[v]:
                         continue
                     if blocked is not None and (c * 8 + k) in blocked:
                         continue
+                    tight = 0.0
                     if cst is not None:
                         st = cst[v] or cell_status(v)
                         if st == 2:
                             continue
+                        if st == 3:
+                            if t_open:
+                                tight = tight_s if c_tight else enter_s
+                            elif c_tight and troot is not None and troot[c]:
+                                tight = tight_s
+                            else:
+                                continue
                     if rad2:
                         a = v % NX - oi
                         b = v // NX - oj
                         if a * a + b * b > rad2:
                             continue
                     dh = H[v] - hc
-                    cost = ((dlen[k] + K * dh) if dh > 0 else dlen[k]) * inv
+                    cost = ((dlen[k] + K * dh) if dh > 0 else dlen[k]) * inv + tight
                     walk = (w >> k) & 1
                     if not walk:
                         cost += jc
@@ -816,6 +869,8 @@ class Nav:
                         dist[v] = ng
                         prev[v] = c
                         et[v] = 0 if walk else 1
+                        if troot is not None:
+                            troot[v] = 1 if (tight and troot[c]) else 0
                         if hs:
                             a = v % NX - gi
                             b = v // NX - gj
@@ -846,6 +901,8 @@ class Nav:
                             dist[v] = ng
                             prev[v] = c
                             et[v] = 2
+                            if troot is not None:
+                                troot[v] = 0
                             s.face[v] = rec
                             if hs:
                                 a = abs(v % NX - gi)
@@ -886,12 +943,13 @@ class Nav:
             self._zfields = []
             self._zmain = self._zcur = None
 
-    def _zone_field_new(self, sx, sy, sr, tiny, cur=False):
+    def _zone_field_new(self, sx, sy, sr, tiny, cur=False, wide=False):
         f = _ZoneField(self.N)
         f.sx, f.sy, f.sr, f.tiny = sx, sy, sr, tiny
         z = self._zone
-        if cur:
-            # S = inside the current circle; restriction = whole map (we are outside it)
+        if cur or wide:
+            # cur: S = inside the current circle and we are outside it. wide: the restricted field did not
+            # reach us (_zone_widen). Either way the restriction is the whole map.
             f.rx, f.ry, f.rr = sx, sy, 1e9
         else:
             f.rx, f.ry = z.center
@@ -911,6 +969,9 @@ class Nav:
             f.sr = r
             f.scells = cells
             f.climbs = any(self._F[c] & F_ROOF for c in cells)
+        if wide:
+            f.wide = True
+            f.climbs = True
         J0 = max(0, int((f.ry - f.rr - self.gy0) // NAV_STEP))
         J1 = min(self.NY - 1, int((f.ry + f.rr - self.gy0) // NAV_STEP))
         f.rows = (J0, J1)
@@ -992,6 +1053,8 @@ class Nav:
         blocked = self._blocked if self._blocked else None
         cst = self._cst if self._size_check else None
         cell_status = self._cell_status
+        tight_s, enter_s = self._SIZE_TIGHT_COST_S, self._SIZE_TIGHT_ENTER_COST_S
+        t_open = f.wide
         pop, push = heapq.heappop, heapq.heappush
         dlen = DLEN
         climbs = self._climb_to if f.climbs else None
@@ -1000,13 +1063,20 @@ class Nav:
                    / max(0.1, self._CLIMB_COST_PER_M))
         n = 0
         expired = sl.expired if sl is not None else None
+        want, stop_g = f.want, f.stop_g
         while heap:
             g, c = pop(heap)
             if closed[c] or g > d[c]:
                 continue
+            if g > stop_g:                     # wide field: far enough past our own cell
+                heap.clear()
+                break
             closed[c] = 1
             f.pops += 1
+            if c == want:
+                stop_g = f.stop_g = g + WIDE_FIELD_EXTRA_S
             hc = H[c]
+            c_tight = cst is not None and (cst[c] or cell_status(c)) == 3
             for k in range(8):
                 v = c + OFF[k]
                 if v < 0 or v >= N or closed[v] or not inr[v]:
@@ -1017,20 +1087,28 @@ class Nav:
                     continue
                 if blocked is not None and (v * 8 + kk) in blocked:
                     continue
+                tight = 0.0
                 if cst is not None:
                     st = cst[v] or cell_status(v)
                     if st == 2:
                         continue
+                    if c_tight:                    # the walk is v -> c: into a tight cell
+                        if st == 3:
+                            tight = tight_s
+                        elif t_open:
+                            tight = enter_s
+                        elif g > 0.0:              # a closed field enters a tight cell only if it is a seed
+                            continue
                 dh = hc - H[v]
-                cost = ((dlen[kk] + K * dh) if dh > 0 else dlen[kk]) * inv
+                cost = ((dlen[kk] + K * dh) if dh > 0 else dlen[kk]) * inv + tight
                 if not (wv >> kk) & 1:
                     cost += jc
                 ng = g + cost
                 if ng < d[v]:
                     d[v] = ng
                     push(heap, (ng, v))
-            if climbs is not None:
-                for rec in climbs.get(c, ()):
+            if climbs is not None and (t_open or g == 0.0 or not c_tight):
+                for rec in climbs.get(c, ()):         # (a closed field takes no climb onto a tight landing)
                     v = rec["g"]
                     if closed[v] or not inr[v] or rec["h"] > cmax:
                         continue
@@ -1042,6 +1120,29 @@ class Nav:
             if expired is not None and (n & 63) == 0 and expired():
                 return
         f.phase = "done"
+        if self._pos_seen:
+            self._zone_widen(f, self._pos)
+
+    def _zone_widen(self, f, pos) -> None:
+        """The main field is done and never reached our cell: the walking route to the safe set leaves the
+        field's disc, or needs a climb (a next circle that is mostly one roof behind a long building,
+        minisim seed 501). zone_eta then fell back to the straight line (4 s there) and the bot stayed
+        out until the zone had it. Redo the field once over the whole map with climb edges."""
+        try:
+            if f is not self._zmain or f.wide or f.phase != "done" or pos is None:
+                return
+            # the cell under us whatever our height: in the air walkable_cell(z) can snap to a neighbour
+            # at a better-matching height (a roof the restricted field never closed) and widen for nothing
+            c = self.walkable_cell(pos[0], pos[1], None, rings=1)
+            if c < 0 or f.closed[c]:
+                return
+            g = self._zone_field_new(f.sx, f.sy, self._ZONE_TINY_R if f.tiny else f.sr, tiny=f.tiny, wide=True)
+            g.want = c
+            self._zmain = g
+            self._zfields = [x for x in self._zfields if x is not f] + [g]
+            self.stats["zone_widen"] = self.stats.get("zone_widen", 0) + 1
+        except Exception:
+            self.exceptions += 1
 
     def zone_field_done(self) -> bool:
         return self._zmain is not None and self._zmain.phase == "done"
@@ -1092,7 +1193,40 @@ class Nav:
     def zone_descent(self, pos: Vec3) -> Optional[Vec2]:
         """Steepest-descent direction on the time-to-safety field; None inside S. Unsettled cell:
         8.8 fallback (A* path to the nearest S point when available, else the clearance-filtered
-        straight line)."""
+        straight line). A pure direction query (the arbiter ranks with it several times a tick)."""
+        st = self._zone_move(pos, None)
+        return st.direction if st is not None else None
+
+    def zone_steer(self, me, t: Optional[float] = None) -> Steer:
+        """zone_descent for a leg owner that must get into the zone: the full Steer. Runs a climb in
+        progress, begins a climb when the field's first step is one (its approach waits, R13.2w, until
+        our energy covers it), jumps a JUMP edge once the ledge is within the follower's trigger
+        distance. Cached per tick (O1 and M2U can both ask); `t` is the world time, so the cache key
+        does not lag a tick behind when the caller runs before the first world sync."""
+        try:
+            if t is not None:
+                self._t = float(t)
+            self._sync_me(me)
+            pos = tuple(me.pos)
+            key = (self._t, pos, self.energy, bool(me.grounded))
+            hit = self._zs_cache
+            if hit is not None and hit[0] == key:
+                return hit[1]
+            st = None
+            if self._climb is not None:
+                if self._climb.get("zone"):
+                    self._climb["zone_t"] = self._t
+                st = self._climb_step(me)
+            if st is None:
+                st = self._zone_move(pos, me) or Steer(direction=None, rule="8.8")
+            self._zs_cache = (key, st)
+            return st
+        except Exception:
+            self.exceptions += 1
+            return Steer(direction=None, rule="8.8")
+
+    def _zone_move(self, pos: Vec3, me) -> Optional[Steer]:
+        """Zone field step as a Steer (None = no direction). With `me` the first step's jump / climb is acted on."""
         try:
             f = self._field_for(pos)
             if f is None:
@@ -1100,16 +1234,22 @@ class Nav:
             if f is self._zmain and self.in_safe_set(pos):
                 return None
             c = self._field_cell(f, pos)
+            if f is self._zmain and f.phase == "done" and not f.wide and c >= 0 and not f.closed[c]:
+                self._zone_widen(f, pos)            # we walked into a cell the restricted field missed
             if c >= 0 and f.closed[c] and f.d[c] < INF:
                 if f.d[c] <= 0.0:
                     # S cell of the current-circle field: hand over to the main field next call
-                    return self._dir_to((f.sx, f.sy), pos) if f is self._zcur else None
+                    d = self._dir_to((f.sx, f.sy), pos) if f is self._zcur else None
+                    return Steer(direction=d, rule="8.8") if d is not None else None
                 chain = [c]
                 cur = c
+                face0 = None
                 for _ in range(4):
                     nxt = self._descend(f, cur)
                     if nxt < 0:
                         break
+                    if cur == c:
+                        face0 = self._descend_face
                     chain.append(nxt)
                     cur = nxt
                     if f.d[nxt] <= 0.0:
@@ -1125,7 +1265,25 @@ class Nav:
                 if tgt is not None:
                     d = self._dir_to(tgt, pos)
                     if d is not None:
-                        return d
+                        if me is None or len(chain) < 2:
+                            return Steer(direction=d, rule="8.8")
+                        if face0 is not None:
+                            # the field prices a climb at full energy: start it at any energy, its approach
+                            # waits at the foot (R13.2w) instead of pushing into the face. Not inside a ladder
+                            # episode: its legs carry the jet somewhere else.
+                            if (not self._stuck["active"]
+                                    and self.climb_feasible(face0["h"], self.max_energy, self._CLIMB_NAV_RESERVE)):
+                                self._climb_begin(face0, None, None)
+                                self._climb["zone"] = True
+                                self._climb["zone_t"] = self._t
+                                st = self._climb_step(me)
+                                if st is not None:
+                                    return st
+                            return Steer(direction=d, rule="8.8")
+                        k = next((k for k in range(8) if c + self._OFF[k] == chain[1]), None)
+                        if k is not None and (self._J[c] >> k) & 1 and not (self._W[c] >> k) & 1:
+                            return self._hop_steer(self._dir_to(self.cell_xy(chain[1]), pos) or d, pos, me, "8.8")
+                        return Steer(direction=d, rule="8.8")
             # fallback (8.8)
             if f.tiny:
                 target = (f.sx, f.sy)
@@ -1137,23 +1295,33 @@ class Nav:
             self.path_request("_zone", pos, target, {}, self._t)
             job = self._paths.get("_zone")
             if job is not None and job.path is not None:
-                st = self._pursue(job, pos)
+                st = self._pursue(job, pos, me)
                 if st is not None and st.direction is not None:
-                    return st.direction
+                    return st
             d, _ = self._probe_dir(pos, (target[0] - pos[0], target[1] - pos[1]))
-            return d
+            if d is None:
+                return None
+            jump = me is not None and bool(me.grounded) and self._STEP_UP < self._ledge_ahead(pos, d) <= self._JUMP_H
+            return Steer(direction=d, jump=jump, rule="8.8")
         except Exception:
             self.exceptions += 1
             return None
 
     def _descend(self, f, c):
-        """Neighbour of c minimising edge cost + field (the Dijkstra successor toward S)."""
+        """Neighbour of c minimising edge cost + field (the Dijkstra successor toward S), priced exactly as
+        _zone_step priced the walk c -> v: the R12.3 tight-cell costs and the climb height limit included.
+        Without them the step could pick a cell the field had routed around (a notch that saves 3 s of
+        walking but costs 8 s to enter), and the bot wandered off the field's own route.
+        self._descend_face is the climb face when the step is a climb, else None."""
         H, W, J, OFF, N = self._H, self._W, self._J, self._OFF, self.N
         d = f.d
         inv = f.inv
         K = self._SLOPE_COST_K * 0.01
         w = W[c]
+        cst = self._cst if self._size_check else None
+        c_tight = cst is not None and (cst[c] or self._cell_status(c)) == 3
         best, bv = -1, d[c] + 1e-9
+        face = None
         for k in BITS8[w | J[c]]:
             v = c + OFF[k]
             if v < 0 or v >= N or not f.closed[v]:
@@ -1164,16 +1332,32 @@ class Nav:
             cost = ((DLEN[k] + K * dh) if dh > 0 else DLEN[k]) * inv
             if not (w >> k) & 1:
                 cost += self._JUMP_EDGE_COST_S
+            if cst is not None:
+                st = cst[v] or self._cell_status(v)
+                if st == 2:
+                    continue
+                if st == 3:
+                    if c_tight:
+                        cost += self._SIZE_TIGHT_COST_S
+                    elif f.wide:
+                        cost += self._SIZE_TIGHT_ENTER_COST_S
+                    elif d[v] > 0.0:               # a closed field enters a tight cell only if it is a seed
+                        continue
             val = cost + d[v]
             if val < bv:
                 bv, best = val, v
         if f.climbs:
+            cmax = min(self._CLIMB_MAX_H, (self.max_energy - self._CLIMB_NAV_RESERVE - self._CLIMB_COST_PAD)
+                       / max(0.1, self._CLIMB_COST_PER_M))
             for rec in self._climb_from.get(c, ()):
                 v = rec["r"]
-                if f.closed[v]:
+                if f.closed[v] and rec["h"] <= cmax:
+                    if not f.wide and d[v] > 0.0 and cst is not None and (cst[v] or self._cell_status(v)) == 3:
+                        continue
                     val = d[v] + rec["d"] * inv + rec["h"] / max(0.5, self.rise) + self._CLIMB_EDGE_PAD_S
                     if val < bv:
-                        bv, best = val, v
+                        bv, best, face = val, v, rec
+        self._descend_face = face
         return best
 
     @staticmethod
@@ -1275,15 +1459,19 @@ class Nav:
             job.search = None
             job.fail = True
             return
-        s = self._new_search("astar", sc, job.cost, goal_cell=gc, goal=job.goal)
-        s.max_exp = int(self._ASTAR_MAX_EXPANSIONS)
-        s.start = job.start
-        s.key = job.key
-        job.search = s
+        job.search = self._job_search(job, sc, gc, False)
         if sc == gc:
+            s = job.search
             s.found = s.done = True
             s.best = sc
             self._finish_job(job)
+
+    def _job_search(self, job, sc, gc, tight_open):
+        s = self._new_search("astar", sc, job.cost, goal_cell=gc, goal=job.goal, tight_open=tight_open)
+        s.max_exp = int(self._ASTAR_MAX_EXPANSIONS)
+        s.start = job.start
+        s.key = job.key
+        return s
 
     def _restart_job(self, job, pos):
         self._start_job(job, pos, job.goal, job.goal_cell, job.cost)
@@ -1298,6 +1486,12 @@ class Nav:
 
     def _finish_job(self, job, sl=None):
         s = job.search
+        if not s.found and self._size_check and not s.tight_open:
+            # closed search found no way (a grown mech in a walled-in area): search once more with the
+            # tight cells open; that second search finishes the job whatever it finds
+            self.stats["tight_retry"] = self.stats.get("tight_retry", 0) + 1
+            job.search = self._job_search(job, s.origin_cell, job.goal_cell, True)
+            return
         end = s.best if s.best >= 0 else s.origin_cell
         cells = []
         c = end
@@ -1431,6 +1625,8 @@ class Nav:
             self._sync_me(me)
             pos = tuple(me.pos)
             self._last_follow_key = key
+            if self._zone_climb_idle():
+                self._climb = None
             if self._climb is not None:
                 st = self._climb_step(me)
                 if st is not None:
@@ -1659,6 +1855,12 @@ class Nav:
             return Steer(direction=d, climb_boost=boost, rule="R13.2c")
         return self._climb_abort("phase")
 
+    def _zone_climb_idle(self) -> bool:
+        """A zone climb its caller stopped stepping (O1 ended, another owner took the legs): not ours to run
+        for a fight or loot path, and not a failure of the face."""
+        cl = self._climb
+        return cl is not None and bool(cl.get("zone")) and self._t - cl.get("zone_t", self._t) > self._ZONE_CLIMB_IDLE_S
+
     def _climb_done(self):
         cl = self._climb
         self._climb = None
@@ -1677,6 +1879,8 @@ class Nav:
             self._blocked_climb(rec)
             job.stale = True
             self._restart_job(job, self._pos)
+        elif cl and cl.get("zone") and why in ("retry", "energy"):
+            self._blocked_climb(cl["face"])         # the zone field's next step must not pick it again
         return Steer(direction=None, rule="R13.2x:" + why)
 
     def _blocked_climb(self, rec):
@@ -1689,7 +1893,8 @@ class Nav:
 
     # ================================================================== stuck ladder (O5, R13.1)
     def stuck_update(self, world, commanded: Optional[Vec2]):
-        """O5 trigger and the R13.1 recovery ladder. Returns (LegRequest | None, JumpRequest | None,
+        """O5 trigger and the R13.1 recovery ladder. Only a navigation direction (`leg_nav`, set by the arbiter
+        with the move) can pace: a strafing fight owner goes nowhere on purpose. Returns (LegRequest | None, JumpRequest | None,
         BoostRequest | None); the LegRequest goes to intent.unstick."""
         try:
             self._sync_world(world)
@@ -1699,15 +1904,35 @@ class Nav:
             vx, vy = me.vel[0], me.vel[1]
             spd = math.hypot(vx, vy)
             cmag = math.hypot(commanded[0], commanded[1]) if commanded else 0.0
+            if self._zone_climb_idle():
+                self._climb = None
             if self._climb is not None and t - self._climb["t0"] > CLIMB_TIMEOUT_S:
                 # climb_step (which owns the timeout) only runs inside follow(); when another owner (O1, X2)
                 # took the legs mid-climb the climb never ended and O5 stayed disabled for the match
                 self._climb_abort("timeout")
+            pressed, self._stuck_exempt_t = self._stuck_exempt_t, None
+            if pressed is not None and t - pressed <= self._stuck_exempt_age:
+                # the move we are judging was a press on purpose (stuck_exempt): going nowhere is the plan
+                self._stuck_clear()
+                return None, None, None
             if not st["active"]:
                 charging = (getattr(me, "laser_charge", 0.0) or 0.0) > 0.0
                 # low horizontal speed accumulates in the air too (a jump loop in place is stuck);
                 # the trigger itself needs ground contact unless it lasted 2 * STUCK_T
                 trig = cmag >= self._STUCK_MOVE_MIN and spd < self._STUCK_SPEED and not charging
+                # pacing: commanded to move but going nowhere at speed (sideways along a ledge)
+                if cmag >= self._STUCK_MOVE_MIN and self.leg_nav and not charging and self._climb is None:
+                    if st["pace_t0"] is None:
+                        st["pace_t0"], st["pace_p0"] = t, tuple(me.pos)
+                    elif t - st["pace_t0"] >= self._STUCK_PACE_S:
+                        p0 = st["pace_p0"]
+                        if math.hypot(me.pos[0] - p0[0], me.pos[1] - p0[1]) < self._STUCK_PACE_M:
+                            self._stuck_begin(me, commanded, t)
+                            st["pace"] = True
+                            return self._ladder(me, t)
+                        st["pace_t0"], st["pace_p0"] = t, tuple(me.pos)
+                else:
+                    st["pace_t0"] = None
                 if trig and self._climb is None:
                     if st["slow_since"] is None:
                         st["slow_since"] = t
@@ -1720,7 +1945,10 @@ class Nav:
                     st["slow_since"] = None
                     return None, None, None
             # active episode: exits
-            if spd >= self._UNSTUCK_OK_SPEED:
+            # a pacing episode is over when we got away from where it began, not when we are fast
+            moving = (math.hypot(me.pos[0] - st["pos0"][0], me.pos[1] - st["pos0"][1]) >= self._STUCK_PACE_M
+                      if st["pace"] else spd >= self._UNSTUCK_OK_SPEED)
+            if moving:
                 if st["ok_since"] is None:
                     st["ok_since"] = t
                 if t - st["ok_since"] >= self._UNSTUCK_OK_S:
@@ -1728,7 +1956,7 @@ class Nav:
                     return None, None, None
             else:
                 st["ok_since"] = None
-            if t - st["start"] >= self._NAV_RECOVER_MAX_S:
+            if t - st["start"] >= st["limit"]:
                 if not st["blocked"] and st["escape"] is None:
                     self._stuck_block(me, t)
                 self._stuck_end("timeout")
@@ -1738,11 +1966,44 @@ class Nav:
             self.exceptions += 1
             return None, None, None
 
+    def stuck_exempt(self, t: float) -> None:
+        """The leg command of the decision at match time t pushes into something on purpose (X4 at the final
+        point, against a mech that holds it: tactics_endgame). The stuck_update of the next decision, which
+        judges that command against the motion it produced, does not act on it and starts the detector from
+        nothing. One call covers that one stuck_update: the caller repeats it every decision the press lasts.
+        Nothing stays set when it stops calling: the stamp is used up by the next stuck_update, and one that
+        comes later than the next decision (O5 skips stuck_update while the laser charges) finds it too old."""
+        self._stuck_exempt_t = float(t)
+
+    def _stuck_clear(self):
+        """End the episode in progress, if any, and forget everything the trigger had counted: the slow and
+        pacing timers, the episodes of the repeat window, the wedge count. Otherwise a press that lasted
+        longer than STUCK_T would begin an episode on the first tick after it, the third one in the window
+        would relocate and two that ended on the spot would lift."""
+        st = self._stuck
+        if st["active"]:
+            self._stuck_end("exempt")
+        st.update(slow_since=None, ok_since=None, pace_t0=None, pace_p0=None, episodes=[],
+                  wedge_p0=None, wedge_n=0)
+
     def _stuck_begin(self, me, commanded, t):
         st = self._stuck
         ln = math.hypot(commanded[0], commanded[1]) or 1.0
         st.update(active=True, start=t, ok_since=None, slow_since=None, blocked=False, escape=None,
-                  dir=(commanded[0] / ln, commanded[1] / ln), pos0=tuple(me.pos), step_name=None)
+                  dir=(commanded[0] / ln, commanded[1] / ln), pos0=tuple(me.pos), step_name=None,
+                  pace=False, limit=self._NAV_RECOVER_MAX_S, pace_t0=None, lift_end=None)
+        w0 = st["wedge_p0"]
+        if w0 is None or math.hypot(me.pos[0] - w0[0], me.pos[1] - w0[1]) > self._WEDGE_MOVE_M:
+            st["wedge_p0"], st["wedge_n"] = tuple(me.pos), 0
+        if st["wedge_n"] == self._WEDGE_REPEAT_N:
+            # wedged: laddering from the floor never worked, so go up past the highest surface around.
+            # Once per spot: a lift that did not free us leaves the normal ladder (and its escape) to try
+            st["episodes"] = []
+            st["lift_dir"] = self._lift_dir(me, st["dir"])
+            st["lift_top"] = self._lift_top(me)
+            st["steps"] = [("lift", 0.0)]
+            st["limit"] = self._WEDGE_JET_MAX_S + 2.0
+            return
         eps = [e for e in st["episodes"] if t - e <= self._STUCK_REPEAT_WINDOW_S]
         eps.append(t)
         st["episodes"] = eps
@@ -1764,6 +2025,33 @@ class Nav:
         steps.append(("side2", self._UNSTUCK_STEP_S))
         steps.append(("block", 0.0))
         st["steps"] = steps
+
+    def _lift_top(self, me) -> float:
+        """Feet height that clears every nav surface within radius + 3 m of us."""
+        pos = me.pos
+        r = int(self.radius + 3.0)
+        top = pos[2]
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                if dx * dx + dy * dy <= r * r:
+                    h = self._h1(pos[0] + dx, pos[1] + dy)
+                    if h is not None and h > top:
+                        top = h
+        return top + self._CLIMB_CLEAR_M
+
+    def _lift_dir(self, me, fallback):
+        """Compass direction (ring of 16 at radius + 4 m) with the most clearance; ties go to `fallback`."""
+        pos = me.pos
+        r = self.radius + 4.0
+        best, bs = fallback, -1.0
+        for k in range(16):
+            a = k * math.pi / 8
+            d = (math.cos(a), math.sin(a))
+            c = self.md.clearance(pos[0] + d[0] * r, pos[1] + d[1] * r)
+            score = c + 0.01 * (d[0] * fallback[0] + d[1] * fallback[1])
+            if score > bs:
+                best, bs = d, score
+        return best
 
     def _obstacle_top(self, me, d):
         """Top (m) of a ledge >= STEP_UP within 3 m ahead, or the next path point if >= STEP_UP higher."""
@@ -1804,18 +2092,20 @@ class Nav:
         acc = 0.0
         name = None
         for nm, dur in st["steps"]:
-            if el < acc + dur or nm in ("block", "escape"):
+            if el < acc + dur or nm in ("block", "escape", "lift"):
                 name = nm
                 break
             acc += dur
         st["step_name"] = name
         d = st["dir"]
+        if name == "lift":
+            return self._lift(me, t)
         if name == "jump":
-            return (LegRequest(level="O5", rule="R13.1.1", direction=d),
+            return (LegRequest(level="O5", rule="R13.1.1", direction=d, nav=True),
                     JumpRequest(owner="O5", rule="R13.1.1") if me.grounded else None, None)
         if name == "jet":
             want_boost = (not me.grounded or el - acc < 0.15) and me.pos[2] < st["jet_top"] + self._CLIMB_CLEAR_M + 0.3
-            return (LegRequest(level="O5", rule="R13.1.2", direction=d),
+            return (LegRequest(level="O5", rule="R13.1.2", direction=d, nav=True),
                     JumpRequest(owner="O5", rule="R13.1.2") if me.grounded else None,
                     BoostRequest(owner="CLIMB", rule="R13.1.2", want=want_boost))
         if name in ("side1", "side2"):
@@ -1837,6 +2127,21 @@ class Nav:
                     JumpRequest(owner="O5", rule="R13.1.5") if jump else None, None)
         return None, None, None
 
+    def _lift(self, me, t):
+        """Wedge escape: jump and jet until the feet clear the highest surface around, steering to the most open
+        side; the direction is kept for 1 s after the jet so we are over the edge when we come down."""
+        st = self._stuck
+        up = (t - st["start"] < self._WEDGE_JET_MAX_S and me.pos[2] < st["lift_top"]
+              and me.energy >= self._CLIMB_ABORT_ENERGY)
+        if not up and st["lift_end"] is None:
+            st["lift_end"] = t
+        if st["lift_end"] is not None and t - st["lift_end"] >= 1.0:
+            self._stuck_end("lift")
+            return None, None, None
+        return (LegRequest(level="O5", rule="R13.1.6", direction=st["lift_dir"], nav=True),
+                JumpRequest(owner="O5", rule="R13.1.6") if up and me.grounded else None,
+                BoostRequest(owner="CLIMB", rule="R13.1.6", want=up) if up else None)
+
     def _stuck_block(self, me, t):
         st = self._stuck
         d = st["dir"]
@@ -1851,8 +2156,15 @@ class Nav:
             for job in self._paths.values():
                 job.stale = True
                 self._restart_job(job, self._pos)
+        w0 = st["wedge_p0"]
+        if w0 is not None:
+            p = self._pos
+            if math.hypot(p[0] - w0[0], p[1] - w0[1]) <= self._WEDGE_MOVE_M:
+                st["wedge_n"] += 1
+            else:
+                st["wedge_p0"], st["wedge_n"] = None, 0
         st.update(active=False, ok_since=None, slow_since=None, escape=None, step_name=None,
-                  last_end=why)
+                  last_end=why, pace=False, pace_t0=None)
 
     def stuck_active(self) -> bool:
         return bool(self._stuck["active"])
@@ -2343,7 +2655,9 @@ class Nav:
         import time as _t
         end = _t.perf_counter() + max_ms / 1000.0
         sl = Slice(end)
-        for f in self._zfields:
-            while f.phase != "done" and not sl.expired():
-                self._zone_step(f, sl)
+        while not sl.expired():                      # a finished field may be replaced by a wide one
+            f = next((x for x in self._zfields if x.phase != "done"), None)
+            if f is None:
+                break
+            self._zone_step(f, sl)
         self._nav_step(sl)

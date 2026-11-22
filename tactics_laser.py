@@ -42,7 +42,7 @@ def run(sub: str, ctx) -> str:
         m.legs(ctx, rule, (-bvec[0], -bvec[1]), 1.0, None)           # back up
     elif d > hi:
         st = m.go(ctx, "x2", (tr.pos[0], tr.pos[1]), exposure=True)  # close along covered paths
-        m.legs(ctx, rule, st.direction, 1.0, (tr.pos[0], tr.pos[1]))
+        m.legs(ctx, rule, st.direction, 1.0, (tr.pos[0], tr.pos[1]), nav=st.rule != "8.9f")
     else:
         side = m.tac.get("side")
         if side is None or t - m.tac.get("side_t", t) > 3.0:

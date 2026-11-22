@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from contracts import (AIM_PRIO, BOOST_ORDER, LEG_OWNER_ORDER, AimRequest, BoostRequest, FireRequest,
-                       JukeStyle, JumpRequest, LegFilter, LegRequest)
+                       JukeStyle, JumpRequest, LegFilter, LegRequest, Steer)
 
 INF = float("inf")
 KIND_ORDER = {"mortar": 0, "laser_charge": 1, "lightning": 2, "gun": 3}
@@ -404,16 +404,26 @@ class Overlays:
         st.zone_escape = self._o1
         if not self._o1:
             return
-        d = None
         try:
-            d = self.nav.zone_descent(me.pos)
+            if l2 or l3:
+                # a dodge or cover dash owns the legs: only the direction, no climb begun or jumped for it
+                zs = Steer(direction=self.nav.zone_descent(me.pos), rule="8.8")
+            else:
+                zs = self.nav.zone_steer(me, t)
         except Exception:
-            d = None
-        if d is None:
+            zs = None
+        d = zs.direction if zs is not None else None
+        from_nav = d is not None
+        hold = zs is not None and d is None and zs.rule == "R13.2w"      # waiting at a climb's foot for its energy
+        if zs is not None and zs.jump:
+            intent.jump.append(JumpRequest("CLIMB", zs.rule))
+        if zs is not None and zs.climb_boost:
+            intent.boost.append(BoostRequest("CLIMB", zs.rule, True, 0.0))
+        if d is None and not hold:
             z = world.zone
             c = z.center_at(t) if not inside else z.next_center
             d = _unit(c[0] - me.pos[0], c[1] - me.pos[1])
-        intent.legs.append(LegRequest("L4", "O1", d, 1.0, None, juke_ok=False))
+        intent.legs.append(LegRequest("L4", "O1", d, 1.0, None, juke_ok=False, nav=from_nav))
         if d is not None and not l2 and not l3:
             cosmax = math.cos(math.radians(C.ZONE_FILTER_DEG))
             nav, pos = self.nav, me.pos
@@ -431,6 +441,8 @@ class Overlays:
         want = me.energy > C.BOOST_FLOOR_TRAVEL or world.zone.dps * eta >= C.ZONE_OUT_DMG_MAX_FRAC * me.hp
         if macro == "X4" and self._safe_set_dist(world) <= C.FINAL_POINT_TOL_M:
             want = False                                  # X4 scope: no boost at the point
+        if zs is not None and zs.rule.startswith("R13.2"):
+            want = False                                  # the climb's own boost is the one that counts; a ground sprint eats its energy
         intent.boost.append(BoostRequest("O1", "O1", want, 0.0))
 
     # ------------------------------------------------------------------ O8 KEEP_AWAY (filter "low"; R2.3, R4.1 AVOID)
